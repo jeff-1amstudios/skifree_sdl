@@ -10,15 +10,47 @@
 #include "resource.h"
 #include <SDL_image.h>
 #include <stdio.h>
+#include <string.h>
 
 #define ski_assert(exp, line) (void)((exp) || (assertFailed(sourceFilename, line), 0)) // TODO remove need for src param.
+
+// Velocities in the decomp are pixels per 40 ms update. Keep that unit, but
+// integrate it once per presented frame using this scale and sub-pixel carry.
+static float physicsFrameScale = 1.0f;
+static float actorMovementRemainderX[NUM_ACTORS];
+static float actorMovementRemainderY[NUM_ACTORS];
+static float actorMovementRemainderAir[NUM_ACTORS];
+static float actorCounterRemainder[NUM_ACTORS];
+static float permObjectMovementRemainderX[NUM_PERM_OBJECTS];
+static float permObjectMovementRemainderY[NUM_PERM_OBJECTS];
+static float permObjectMovementRemainderAir[NUM_PERM_OBJECTS];
+static DWORD logicTimeAccumulator;
+static BOOL perFramePhysicsEnabled = TRUE;
+
+static void updateMovementOnly(void);
+
+static int takeScaledMovement(short velocity, float* remainder) {
+    int movement;
+
+    *remainder += velocity * physicsFrameScale;
+    movement = (int)*remainder;
+    *remainder -= movement;
+    return movement;
+}
 
 // int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
 int main(int argc, char* argv[]) {
     int iVar1;
     BOOL retVal;
     // MSG msg;
+
     SDL_Event event;
+
+    for (iVar1 = 1; iVar1 < argc; iVar1++) {
+        if (strcmp(argv[iVar1], "--no-per-frame-physics") == 0) {
+            perFramePhysicsEnabled = FALSE;
+        }
+    }
 
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) < 0) {
         printf("failed to init\n");
@@ -62,7 +94,6 @@ int main(int argc, char* argv[]) {
     paintStatusWindow(NULL);
 
     int is_running = 1;
-    int last_timer = SDL_GetTicks();
     while (is_running) {
         while (SDL_PollEvent(&event)) {
             switch (event.type) {
@@ -78,9 +109,13 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        if (isGameTimerRunning && last_timer + 40 < SDL_GetTicks()) {
-            timerUpdateFunc();
-            last_timer = SDL_GetTicks();
+        if (isGameTimerRunning) {
+            DWORD ticks = SDL_GetTicks();
+            if (perFramePhysicsEnabled && currentTickCount != ticks) {
+                timerUpdateFunc();
+            } else if (!perFramePhysicsEnabled && currentTickCount + updateTimerDurationMillis < ticks) {
+                timerUpdateFunc();
+            }
         }
 
         mainWindowPaint(hSkiMainWnd);
@@ -110,7 +145,19 @@ void timerUpdateFunc(void) {
     timerFrameDurationInMillis = ticks - currentTickCount;
     prevTickCount = currentTickCount;
     currentTickCount = ticks;
-    updateGameState();
+    if (perFramePhysicsEnabled) {
+        physicsFrameScale = (float)timerFrameDurationInMillis / (float)updateTimerDurationMillis;
+        logicTimeAccumulator += timerFrameDurationInMillis;
+        if (logicTimeAccumulator >= (DWORD)updateTimerDurationMillis) {
+            logicTimeAccumulator -= updateTimerDurationMillis;
+            updateGameState();
+        } else {
+            updateMovementOnly();
+        }
+    } else {
+        physicsFrameScale = 1.0f;
+        updateGameState();
+    }
     drawWindow(mainWindowDC, &windowClientRect);
     redrawRequired = TRUE;
     if (currentTickCount - statusWindowLastUpdateTime > 327) {
@@ -464,11 +511,20 @@ int initWindows() {
         nWidth, nHeight,
         SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
 
-    renderer = SDL_CreateRenderer(hSkiMainWnd, -1, SDL_RENDERER_ACCELERATED);
+    renderer = SDL_CreateRenderer(hSkiMainWnd, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    if (renderer == NULL) {
+        fprintf(stderr, "Could not create a vsynced renderer: %s\n", SDL_GetError());
+        renderer = SDL_CreateRenderer(hSkiMainWnd, -1, SDL_RENDERER_ACCELERATED);
+    }
+    if (renderer == NULL) {
+        fprintf(stderr, "Could not create an accelerated renderer: %s\n", SDL_GetError());
+        return 0;
+    }
 
     SDL_RendererInfo info;
     SDL_GetRendererInfo(renderer, &info);
     printf("Renderer name: %s\n", info.name);
+    printf("VSync: %s\n", (info.flags & SDL_RENDERER_PRESENTVSYNC) != 0 ? "enabled" : "unavailable");
     printf("Texture formats:\n");
     for (int i = 0; i < info.num_texture_formats; i++) {
         printf("%s\n", SDL_GetPixelFormatName(info.texture_formats[i]));
@@ -564,23 +620,27 @@ Actor* updateActorPositionWithVelocityMaybe(Actor* actor) {
     short newX;
     short newY;
     short inAir;
-
-    newX = actor->xPosMaybe + actor->HorizontalVelMaybe;
-    newY = actor->yPosMaybe + actor->verticalVelocityMaybe;
-    inAir = actor->isInAir + actor->inAirCounter;
+    int actorIndex;
+    int counterUpdates;
+    int speedMultiplier;
 
     ski_assert(actor, 1061);
 
-    if (isTurboMode != 0) {
-        newX = newX + actor->HorizontalVelMaybe;
-        newY = newY + actor->verticalVelocityMaybe;
-        inAir = inAir + actor->inAirCounter;
-    }
+    actorIndex = (int)(actor - actors);
+    speedMultiplier = isTurboMode != 0 ? 2 : 1;
+    newX = actor->xPosMaybe + takeScaledMovement(actor->HorizontalVelMaybe * speedMultiplier, &actorMovementRemainderX[actorIndex]);
+    newY = actor->yPosMaybe + takeScaledMovement(actor->verticalVelocityMaybe * speedMultiplier, &actorMovementRemainderY[actorIndex]);
+    inAir = actor->isInAir + takeScaledMovement(actor->inAirCounter * speedMultiplier, &actorMovementRemainderAir[actorIndex]);
+
     if (inAir > 0) {
-        actor->inAirCounter--;
+        actorCounterRemainder[actorIndex] += physicsFrameScale;
+        counterUpdates = (int)actorCounterRemainder[actorIndex];
+        actorCounterRemainder[actorIndex] -= counterUpdates;
+        actor->inAirCounter -= counterUpdates;
         return updateActorPositionMaybe(actor, newX, newY, inAir);
     }
     actor->inAirCounter = 0;
+    actorCounterRemainder[actorIndex] = 0.0f;
     return updateActorPositionMaybe(actor, newX, newY, 0);
 }
 
@@ -588,6 +648,7 @@ void startGameTimer() {
     if (hSkiMainWnd && !isGameTimerRunning && !isPaused) {
         isGameTimerRunning = TRUE;
         currentTickCount = SDL_GetTicks();
+        logicTimeAccumulator = 0;
         if ((isSsGameMode != 0) || (isGsGameMode != 0)) {
             timedGameRelated = timedGameRelated + (currentTickCount - pauseStartTickCount);
         }
@@ -672,6 +733,8 @@ short ski_random(short maxValue) {
 
 Actor* addActor(Actor* actor, BOOL insertBack) {
     Actor* targetActor;
+    int sourceIndex;
+    int targetIndex;
 
     targetActor = currentFreeActor;
     ski_assert(actor, 840);
@@ -680,6 +743,19 @@ Actor* addActor(Actor* actor, BOOL insertBack) {
         currentFreeActor = targetActor->next;
 
         memcpy(targetActor, actor, sizeof(Actor));
+        targetIndex = (int)(targetActor - actors);
+        if (actor == &blankTemplateActor) {
+            actorMovementRemainderX[targetIndex] = 0.0f;
+            actorMovementRemainderY[targetIndex] = 0.0f;
+            actorMovementRemainderAir[targetIndex] = 0.0f;
+            actorCounterRemainder[targetIndex] = 0.0f;
+        } else {
+            sourceIndex = (int)(actor - actors);
+            actorMovementRemainderX[targetIndex] = actorMovementRemainderX[sourceIndex];
+            actorMovementRemainderY[targetIndex] = actorMovementRemainderY[sourceIndex];
+            actorMovementRemainderAir[targetIndex] = actorMovementRemainderAir[sourceIndex];
+            actorCounterRemainder[targetIndex] = actorCounterRemainder[sourceIndex];
+        }
 
         targetActor->permObject = NULL;
         if (insertBack) {
@@ -798,6 +874,7 @@ RECT* updateActorSpriteRect(Actor* actor) {
 
 void mainWindowPaint(HWND param_1) {
     RECT r;
+
     r.left = 0;
     r.right = windowClientRect.right;
     r.top = 0;
@@ -2490,6 +2567,15 @@ Actor* addActorForPermObject(PermObject* permObject) {
     return permObject->actor;
 }
 
+static void movePermObject(PermObject* permObject) {
+    int permObjectIndex;
+
+    permObjectIndex = (int)(permObject - permObjects);
+    permObject->maybeX += takeScaledMovement(permObject->xVelocity, &permObjectMovementRemainderX[permObjectIndex]);
+    permObject->maybeY += takeScaledMovement(permObject->yVelocity, &permObjectMovementRemainderY[permObjectIndex]);
+    permObject->unk_0x18 += takeScaledMovement(permObject->unk_0x1e, &permObjectMovementRemainderAir[permObjectIndex]);
+}
+
 // TODO not byte accurate
 void updatePermObject(PermObject* permObject) {
     Actor* pAVar1;
@@ -2498,10 +2584,8 @@ void updatePermObject(PermObject* permObject) {
     if (permObject == (PermObject*)0x0) {
         assertFailed(sourceFilename, 2791);
     }
-    permObject->maybeX = permObject->maybeX + permObject->xVelocity;
+    movePermObject(permObject);
     actorType = permObject->actorTypeMaybe;
-    permObject->maybeY = permObject->maybeY + permObject->yVelocity;
-    permObject->unk_0x18 = permObject->unk_0x18 + permObject->unk_0x1e;
     if (actorType != ACTOR_TYPE_4_CHAIRLIFT) {
         // TODO this is byte accurate but probably not how it was originally written in C
         if ((actorType <= 4) || (8 < actorType)) {
@@ -2995,8 +3079,8 @@ void formatAndPrintStatusStrings(HDC windowDC) {
     sVar1 = 0;
 
     if (playerActor != NULL) {
-        if (timerFrameDurationInMillis != 0) {
-            speed = (short)((int)(playerActor->verticalVelocityMaybe * 1000) / (int)(timerFrameDurationInMillis * 16));
+        if (updateTimerDurationMillis != 0) {
+            speed = (short)((int)(playerActor->verticalVelocityMaybe * 1000) / (int)(updateTimerDurationMillis * 16));
         } else {
             speed = 0;
         }
@@ -3055,6 +3139,9 @@ PermObject* addPermObject(PermObjectList* objList, PermObject* permObject) {
     ski_assert(objList->nextObject == pPVar1, 2592);
     objList->nextObject = objList->nextObject + 1;
     memcpy(pPVar1, permObject, sizeof(PermObject));
+    permObjectMovementRemainderX[pPVar1 - permObjects] = 0.0f;
+    permObjectMovementRemainderY[pPVar1 - permObjects] = 0.0f;
+    permObjectMovementRemainderAir[pPVar1 - permObjects] = 0.0f;
     pPVar1->actor = NULL;
     pPVar1->spritePtr = &sprites[(uint16_t)pPVar1->spriteIdx];
 
@@ -3527,6 +3614,43 @@ void updateGameState() {
 
     /* top of screen */
     updateActorWithOffscreenStartingPosition(pAVar7, BORDER_TOP);
+}
+
+static BOOL actorUsesVelocityMovement(const Actor* actor) {
+    switch (actor->typeMaybe) {
+    case ACTOR_TYPE_0_PLAYER:
+        return actor->frameNo != 0xb;
+    case ACTOR_TYPE_1_BEGINNER:
+        return actor->frameNo < 25;
+    case ACTOR_TYPE_2_DOG:
+    case ACTOR_TYPE_3_SNOWBOARDER:
+    case ACTOR_TYPE_10_WALKING_TREE:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+static void updateMovementOnly(void) {
+    Actor* actor;
+    Actor* nextActor;
+    PermObject* permObject;
+
+    for (actor = actorListPtr; actor != NULL; actor = nextActor) {
+        nextActor = actor->next;
+        if ((actor->flags & (FLAG_2 | FLAG_8)) == 0 && actor->permObject == NULL && actorUsesVelocityMovement(actor)) {
+            updateActorPositionWithVelocityMaybe(actor);
+        }
+    }
+
+    for (permObject = PermObjectList_0040c720.startingObject;
+         permObject != NULL && permObject < PermObjectList_0040c720.nextObject;
+         permObject++) {
+        movePermObject(permObject);
+        if (permObject->actor != NULL) {
+            updateActorPositionMaybe(permObject->actor, permObject->maybeX, permObject->maybeY, permObject->unk_0x18);
+        }
+    }
 }
 
 // TODO not byte accurate register usage is swapped.

@@ -41,6 +41,18 @@ cd build
 cmake ..
 ```
 
+Per-frame physics is enabled by default. To use the original 40 ms movement updates instead:
+
+```sh
+./build/skifree_sdl --no-per-frame-physics
+```
+
+On macOS, run the app bundle with the option using:
+
+```sh
+open build/skifree_sdl.app --args --no-per-frame-physics
+```
+
 ## MacOS
 On MacOS we build an app bundle `skifree_sdl.app`. Use right-click > Open the first time to get around [unverified developer warnings](https://support.apple.com/en-nz/guide/mac-help/mh40616/mac).
 
