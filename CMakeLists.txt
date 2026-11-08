@@ -43,7 +43,7 @@ if (APPLE)
         MACOSX_BUNDLE_SHORT_VERSION_STRING "0.1"
         MACOSX_BUNDLE_ICON_FILE ski32.icns
     )
-    
+
     target_sources(${PROJECT_NAME} PRIVATE
         ski32.icns
     )
@@ -52,6 +52,7 @@ if (APPLE)
         include(BundleUtilities)
         fixup_bundle(${CMAKE_BINARY_DIR}/${PROJECT_NAME}.app \"\" \"/Library/Frameworks\")
         ")
+
 
 else()
     add_executable(${PROJECT_NAME})
@@ -63,13 +64,13 @@ add_custom_command(
     DEPENDS ${resource_files}
 )
 
-target_sources(${PROJECT_NAME} PRIVATE 
+target_sources(${PROJECT_NAME} PRIVATE
     src/skifree_decomp.c
     embedded_resources.h
 )
 
 # Add all headers files under the include directory
-target_include_directories(${PROJECT_NAME} PRIVATE 
+target_include_directories(${PROJECT_NAME} PRIVATE
     include
     ${CMAKE_CURRENT_BINARY_DIR}
     ${SDL2IMAGE_INCLUDE_DIR}
